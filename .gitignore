@@ -1,0 +1,3 @@
+target/
+.m2/
+__pycache__/
