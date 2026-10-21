@@ -176,6 +176,10 @@ class Checks:
         return 1 if self.failed else 0
 
 
+def passed(event):
+    return (event.get("details") or {}).get("altcha") == "passed"
+
+
 def is_altcha_failure(page):
     return page.code() is None and any(t in page.message for t in ALTCHA_FAILED)
 
@@ -379,6 +383,12 @@ def scenarios(c, base, realm, admin, login_exec, user_id, redirect_uri, insecure
     events = admin("GET", f"/{realm}/events?type=LOGIN_ERROR&max=100")
     c.check("LOGIN_ERROR events carry error invalid_captcha",
             any(e.get("error") == "invalid_captcha" for e in events), events[:3])
+    c.check("invalid_captcha events do not carry altcha=passed",
+            not any(e.get("error") == "invalid_captcha" and passed(e) for e in events), events[:3])
+    c.check("wrong-password LOGIN_ERROR carries altcha=passed",
+            any(e.get("error") == "invalid_user_credentials" and passed(e) for e in events), events[:3])
+    logins = admin("GET", f"/{realm}/events?type=LOGIN&max=100")
+    c.check("LOGIN event carries altcha=passed", any(passed(e) for e in logins), logins[:3])
 
     # authenticator config through the Admin REST API
     config_id = admin("POST", f"/{realm}/authentication/executions/{login_exec}/config",
@@ -387,6 +397,8 @@ def scenarios(c, base, realm, admin, login_exec, user_id, redirect_uri, insecure
     c.check("disabled: no challenge attribute", not page.challenge, page.challenge)
     res = post(b, page)
     c.check("disabled: login without payload succeeds", res.code(), describe(res))
+    newest = admin("GET", f"/{realm}/events?type=LOGIN&max=1")
+    c.check("disabled: LOGIN event has no altcha detail", newest and not passed(newest[0]), newest)
     admin("PUT", f"/{realm}/authentication/config/{config_id}",
           {"id": config_id, "alias": "altcha-e2e-login",
            "config": {"altchaEnabled": "true", "altchaDifficulty": "3"}})
@@ -420,6 +432,7 @@ def scenarios(c, base, realm, admin, login_exec, user_id, redirect_uri, insecure
     sent = admin("GET", f"/{realm}/events?type=SEND_RESET_PASSWORD_ERROR&max=100")
     c.check("reset: mail step reached for tester (email_send_failed, no SMTP configured)",
             any(e.get("details", {}).get("username") == "tester" for e in sent), sent)
+    c.check("reset: mail step event carries altcha=passed", any(passed(e) for e in sent), sent)
 
     # passkeys (conditional WebAuthn UI) post from a separate form with no ALTCHA field
     rep = admin("GET", f"/{realm}")  # a PUT with only this field is ignored

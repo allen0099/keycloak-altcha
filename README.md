@@ -28,7 +28,10 @@ solved on the login page and the forgot-password page.
 
 Both extend the built-in classes and only add the ALTCHA check in front; everything else behaves
 like the built-in step. A failed check logs an event with error `invalid_captcha` (`LOGIN_ERROR` or
-`RESET_PASSWORD_ERROR`) and shows the message `altchaFailed`. A failed check is not a failed login:
+`RESET_PASSWORD_ERROR`) and shows the message `altchaFailed`. A passed check adds the detail
+`altcha=passed` to the event the request ends with (`LOGIN`, `LOGIN_ERROR` for a wrong password,
+`SEND_RESET_PASSWORD`, ...), so captcha pass and fail counts can be read from the realm's events. A
+login that finishes in a later request (OTP, required actions) does not carry the detail. A failed check is not a failed login:
 it does not count towards brute-force lockout of any user, so a wrong or missing ALTCHA cannot be
 used to lock an account. Passkey sign-ins (conditional WebAuthn UI) do not check a password and
 skip the ALTCHA check.
