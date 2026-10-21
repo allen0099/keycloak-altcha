@@ -21,7 +21,7 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <!-- also selects the Keycloak image the integration test runs against -->
-    <keycloak.version>26.8.0</keycloak.version>
+    <keycloak.version>26.8.1</keycloak.version>
   </properties>
 
   <dependencies>
