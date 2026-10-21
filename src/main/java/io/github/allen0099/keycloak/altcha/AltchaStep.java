@@ -23,6 +23,12 @@ final class AltchaStep {
     /** Message key shown when the check fails; bundled in theme-resources/messages. */
     static final String ERROR_MESSAGE = "altchaFailed";
     static final String EVENT_ERROR = "invalid_captcha";
+    /**
+     * Event detail set when a challenge is solved, so whatever event the request ends with (LOGIN,
+     * LOGIN_ERROR, SEND_RESET_PASSWORD...) shows it got past the captcha. Absent when ALTCHA is off.
+     */
+    static final String EVENT_DETAIL = "altcha";
+    static final String EVENT_DETAIL_PASSED = "passed";
 
     static final String ENABLED = "altchaEnabled";
     static final String DIFFICULTY = "altchaDifficulty";
@@ -89,8 +95,14 @@ final class AltchaStep {
         // Removing the note only stops sequential reuse: parallel requests in one auth session all
         // read it before the removal is committed. The single-use store's putIfAbsent is atomic,
         // cluster-wide too, so only one of them gets through. The entry outlives any challenge.
-        return Altcha.verify(record, payload, now())
+        boolean passed = Altcha.verify(record, payload, now())
                 && context.getSession().singleUseObjects().putIfAbsent(NOTE + ":" + record, MAX_TTL);
+        if (passed) {
+            // Only reaches events logged in this request; a login finished later (OTP,
+            // required actions) carries no detail. Persist it as an auth note if those must count.
+            context.getEvent().detail(EVENT_DETAIL, EVENT_DETAIL_PASSED);
+        }
+        return passed;
     }
 
     private static Map<String, String> values(AuthenticatorConfigModel config) {
