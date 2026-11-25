@@ -118,13 +118,19 @@ public final class Altcha {
 
     /** Same derivation as the widget: SHA-256^cost(salt || nonce || uint32be(counter)). */
     static byte[] deriveKey(byte[] nonce, byte[] salt, long counter, int cost) throws NoSuchAlgorithmException {
+        return deriveKey(nonce, salt, counter, cost, KEY_LENGTH);
+    }
+
+    /** Same derivation, truncated to the challenge's {@code keyLength}. */
+    static byte[] deriveKey(byte[] nonce, byte[] salt, long counter, int cost, int keyLength)
+            throws NoSuchAlgorithmException {
         byte[] key = ByteBuffer.allocate(salt.length + nonce.length + 4)
                 .put(salt).put(nonce).putInt((int) counter).array();
         MessageDigest sha = MessageDigest.getInstance("SHA-256");
         for (int i = 0; i < Math.max(1, cost); i++) {
             key = sha.digest(key);
         }
-        return Arrays.copyOf(key, Math.min(KEY_LENGTH, key.length));
+        return Arrays.copyOf(key, Math.min(Math.max(1, keyLength), key.length));
     }
 
     private static String randomHex() {

@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.io.InputStreamReader;
@@ -75,6 +76,129 @@ class AltchaTest {
                 AltchaStep.TTL, "abc"));
         assertFalse(AltchaStep.enabled(config));
         assertEquals(new Altcha.Settings(4, 50, 600), AltchaStep.settings(config));
+    }
+
+    @Test
+    void externalModeNeedsBothAServerUrlAndASecret() {
+        assertFalse(AltchaStep.external(null));
+        assertFalse(AltchaStep.external(new AltchaConfigModelStub(Map.of(
+                AltchaStep.SERVER_URL, "https://sentinel.example.com/v1/challenge"))));
+        assertFalse(AltchaStep.external(new AltchaConfigModelStub(Map.of(
+                AltchaStep.SECRET, "sec_test"))));
+        assertTrue(AltchaStep.external(new AltchaConfigModelStub(Map.of(
+                AltchaStep.SERVER_URL, "https://sentinel.example.com/v1/challenge",
+                AltchaStep.SECRET, "sec_test"))));
+    }
+
+    @Test
+    void apiKeyIsAddedToTheServerUrlOnlyWhenItHasNone() {
+        assertEquals("https://sentinel.example.com/v1/challenge?apiKey=key_1",
+                AltchaServer.challengeUrl(" https://sentinel.example.com/v1/challenge ", "key_1"));
+        assertEquals("https://sentinel.example.com/v1/challenge?x=1&apiKey=key_1",
+                AltchaServer.challengeUrl("https://sentinel.example.com/v1/challenge?x=1", "key_1"));
+        assertEquals("https://sentinel.example.com/v1/challenge?apiKey=key_2",
+                AltchaServer.challengeUrl("https://sentinel.example.com/v1/challenge?apiKey=key_2", "key_1"));
+        assertEquals("https://sentinel.example.com/v1/challenge",
+                AltchaServer.challengeUrl("https://sentinel.example.com/v1/challenge", ""));
+    }
+
+    @Test
+    void sentinelPayloadVerifiesOnlyWithItsSecretAndBeforeExpiry() throws Exception {
+        String secret = "sec_test";
+        String verificationData = "verified=true&expire=" + (NOW + 60) + "&score=90";
+        String payload = sentinelPayload(secret, "SHA-256", verificationData, true);
+
+        assertTrue(AltchaServer.verify(payload, secret, NOW));
+        assertFalse(AltchaServer.verify(payload, "other", NOW), "wrong secret");
+        assertTrue(AltchaServer.verify(payload, secret, NOW + 60), "still valid at expire");
+        assertFalse(AltchaServer.verify(payload, secret, NOW + 61), "expired");
+        assertFalse(AltchaServer.verify(sentinelPayload(secret, "SHA-256", verificationData, false), secret, NOW),
+                "payload not marked verified");
+
+        JsonNode changed = decode(payload);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) changed)
+                .put("verificationData", verificationData.replace("score=90", "score=99"));
+        String tampered = Base64.getEncoder().encodeToString(JSON.writeValueAsBytes(changed));
+        assertFalse(AltchaServer.verify(tampered, secret, NOW), "tampered verification data");
+        assertFalse(AltchaServer.verify(null, secret, NOW));
+        assertFalse(AltchaServer.verify(payload, "", NOW));
+    }
+
+    @Test
+    void sentinelPayloadSupportsSha1() throws Exception {
+        String secret = "sec_test";
+        String verificationData = "verified=true&expire=" + (NOW + 60);
+        assertTrue(AltchaServer.verify(sentinelPayload(secret, "SHA-1", verificationData, true), secret, NOW));
+    }
+
+    @Test
+    void replayKeyIgnoresUnrelatedJsonChanges() throws Exception {
+        String secret = "sec_test";
+        String payload = sentinelPayload(secret, "SHA-256", "verified=true&expire=" + (NOW + 60), true);
+        JsonNode changed = decode(payload);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) changed).put("unused", "junk");
+        String reencoded = Base64.getEncoder().encodeToString(JSON.writeValueAsBytes(changed));
+        assertEquals(AltchaServer.replayKey(payload), AltchaServer.replayKey(reencoded));
+    }
+
+    @Test
+    void signedChallengeFromAnExternalServerVerifiesItsProofOfWork() throws Exception {
+        String secret = "hmac_test";
+        String nonce = "00112233445566778899aabbccddeeff";
+        String salt = "ffeeddccbbaa99887766554433221100";
+        Map<String, Object> parameters = new java.util.TreeMap<>();
+        parameters.put("algorithm", "SHA-256");
+        parameters.put("nonce", nonce);
+        parameters.put("salt", salt);
+        parameters.put("cost", 1);
+        parameters.put("keyLength", 32);
+        parameters.put("keyPrefix", "00");
+        parameters.put("expiresAt", NOW + 60);
+        String canonical = JSON.writeValueAsString(parameters);
+        assertEquals(canonical, AltchaServer.canonicalJson(JSON.readTree(canonical)));
+        String signature = hmacHex("SHA-256", canonical.getBytes(StandardCharsets.UTF_8), secret);
+
+        byte[] nonceBytes = HEX.parseHex(nonce);
+        byte[] saltBytes = HEX.parseHex(salt);
+        String derivedKey = null;
+        long counter = -1;
+        for (long c = 0; derivedKey == null; c++) {
+            String key = HEX.formatHex(Altcha.deriveKey(nonceBytes, saltBytes, c, 1));
+            if (key.startsWith("00")) {
+                derivedKey = key;
+                counter = c;
+            }
+        }
+        String payload = Base64.getEncoder().encodeToString(("{\"challenge\":{\"parameters\":" + canonical
+                + ",\"signature\":\"" + signature + "\"},"
+                + "\"solution\":{\"counter\":" + counter + ",\"derivedKey\":\"" + derivedKey + "\"}}")
+                .getBytes(StandardCharsets.UTF_8));
+
+        assertTrue(AltchaServer.verify(payload, secret, NOW));
+        assertFalse(AltchaServer.verify(payload, "other", NOW), "wrong secret");
+        assertFalse(AltchaServer.verify(payload, secret, NOW + 61), "expired");
+        JsonNode tampered = decode(payload);
+        ((com.fasterxml.jackson.databind.node.ObjectNode)
+                        tampered.path("challenge").path("parameters"))
+                .put("cost", 2);
+        assertFalse(AltchaServer.verify(
+                        Base64.getEncoder().encodeToString(JSON.writeValueAsBytes(tampered)), secret, NOW),
+                "tampered parameters");
+    }
+
+    static String sentinelPayload(String secret, String algorithm, String verificationData, boolean verified)
+            throws Exception {
+        byte[] digest = MessageDigest.getInstance(algorithm).digest(verificationData.getBytes(StandardCharsets.UTF_8));
+        String json = "{\"algorithm\":\"" + algorithm + "\",\"verified\":" + verified
+                + ",\"signature\":\"" + hmacHex(algorithm, digest, secret) + "\","
+                + "\"verificationData\":\"" + verificationData + "\"}";
+        return Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String hmacHex(String algorithm, byte[] data, String secret) throws Exception {
+        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("Hmac" + algorithm.replace("-", ""));
+        mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), mac.getAlgorithm()));
+        return HEX.formatHex(mac.doFinal(data));
     }
 
     @Test
