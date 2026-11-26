@@ -39,6 +39,7 @@ final class AltchaStep {
     static final String SERVER_URL = "altchaServerUrl";
     static final String API_KEY = "altchaApiKey";
     static final String SECRET = "altchaSecret";
+    static final String VERIFY_URL = "altchaVerifyUrl";
 
     private static final String NOTE = "altcha.challenge";
     private static final long MAX_TTL = 3600;
@@ -71,6 +72,9 @@ final class AltchaStep {
             .property().name(SECRET).type(ProviderConfigProperty.PASSWORD)
             .label("altchaSecretLabel").helpText("altchaSecretHelp").secret(true)
             .defaultValue("").add()
+            .property().name(VERIFY_URL).type(ProviderConfigProperty.STRING_TYPE)
+            .label("altchaVerifyUrlLabel").helpText("altchaVerifyUrlHelp")
+            .defaultValue("").add()
             .build();
 
     private AltchaStep() {}
@@ -98,9 +102,19 @@ final class AltchaStep {
             return;
         }
         if (external(config)) {
-            // The widget fetches (and, for Sentinel, verifies) the challenge itself.
+            // The challenge is fetched here, so the browser does not need a route to the external
+            // server and the server does not have to allow the origin of the login page.  Only
+            // when the fetch fails the widget gets the URL and has to fetch it itself.
             context.getAuthenticationSession().removeAuthNote(NOTE);
-            context.form().setAttribute(ATTRIBUTE, AltchaServer.challengeUrl(serverUrl(config), apiKey(config)));
+            String url = AltchaServer.challengeUrl(serverUrl(config), apiKey(config));
+            String challenge = AltchaServer.fetchChallenge(url);
+            if (challenge != null) {
+                context.form().setAttribute(ATTRIBUTE, challenge);
+            } else {
+                LOG.warning("could not fetch the challenge from the external server; the widget "
+                        + "has to fetch it itself");
+                context.form().setAttribute(ATTRIBUTE, url);
+            }
             return;
         }
         warnIfServerUrlIsUnusable(config);
@@ -119,7 +133,9 @@ final class AltchaStep {
         if (external(config)) {
             // The server signature proves the payload came from the configured server; the
             // single-use store, not an auth note, stops a valid payload from being replayed.
-            passed = AltchaServer.verify(payload, secret(config), now())
+            boolean verified = AltchaServer.verify(payload, secret(config), now());
+            passed = verified
+                    && report(config, payload)
                     && context.getSession()
                             .singleUseObjects()
                             .putIfAbsent(NOTE + ":server:" + AltchaServer.replayKey(payload), MAX_TTL);
@@ -140,6 +156,34 @@ final class AltchaStep {
             context.getEvent().detail(EVENT_DETAIL, EVENT_DETAIL_PASSED);
         }
         return passed;
+    }
+
+    /**
+     * Reports a solved payload to the external server, so that the server knows about the
+     * verification: it keeps its own statistics, and it can refuse payloads it does not like (a
+     * replay, a bot score above its threshold).
+     *
+     * <p>The payload was checked cryptographically already, so a server that cannot be reached
+     * must not lock anybody out: the step passes and the problem is logged. A server that refuses
+     * the payload is believed, and the step fails.
+     */
+    private static boolean report(AuthenticatorConfigModel config, String payload) {
+        String url = verifyUrl(config);
+        if (url.isEmpty()) {
+            return true;
+        }
+        Boolean accepted =
+                AltchaServer.forwardVerification(AltchaServer.verifyUrl(url, apiKey(config)), payload);
+        if (accepted == null) {
+            LOG.warning("could not report the ALTCHA verification to the external server " + url);
+            return true;
+        }
+        if (!accepted) {
+            LOG.warning("the external server refused the ALTCHA verification of the payload");
+        } else {
+            LOG.info("reported the ALTCHA verification to the external server " + url);
+        }
+        return accepted;
     }
 
     /** With a server URL but no secret the payload cannot be checked, so the built-in mode is used. */
@@ -166,6 +210,10 @@ final class AltchaStep {
 
     private static String secret(AuthenticatorConfigModel config) {
         return text(config, SECRET);
+    }
+
+    private static String verifyUrl(AuthenticatorConfigModel config) {
+        return text(config, VERIFY_URL);
     }
 
     private static String text(AuthenticatorConfigModel config, String key) {

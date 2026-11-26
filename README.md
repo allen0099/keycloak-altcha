@@ -102,9 +102,10 @@ step. Labels and help texts are translated (English and Traditional Chinese bund
 | `altchaDifficulty` | Leading zero hex digits the solution needs; each step multiplies the work by 16 | `4` | `3`, `4` |
 | `altchaCost` | SHA-256 iterations per attempt; work grows linearly, for fine tuning | `1` | 1–1000 |
 | `altchaTtlSeconds` | How long an issued challenge stays valid | `600` | 60–3600 |
-| `altchaServerUrl` | Challenge endpoint of an external ALTCHA server; the browser fetches challenges from it | empty (built-in) | any HTTP(S) URL |
+| `altchaServerUrl` | Challenge endpoint of an external ALTCHA server; Keycloak fetches the challenges from it | empty (built-in) | any HTTP(S) URL |
 | `altchaApiKey` | Public API key (`key_...`) added to the server URL as `apiKey=...` when the URL has none | empty | any string |
 | `altchaSecret` | API key secret (`sec_...`) or the HMAC key of the external server, used to verify payloads | empty | any string |
+| `altchaVerifyUrl` | Verification endpoint of the external server; a solved payload is reported to it | empty (no reporting) | any HTTP(S) URL |
 
 - With no config saved, the defaults apply and ALTCHA is **on**.
 - Missing, unparsable or out-of-range values fall back to the default; they never break logins.
@@ -115,8 +116,12 @@ step. Labels and help texts are translated (English and Traditional Chinese bund
 ### External ALTCHA server
 
 Set `altchaServerUrl` (and normally `altchaApiKey`) to delegate challenge generation to your own
-ALTCHA server. The widget reads the URL from `altchaChallenge` and fetches the challenge itself,
-exactly as in the [ALTCHA widget documentation](https://altcha.org/docs/integration/widget/).
+ALTCHA server. Keycloak fetches the challenge from that server and hands the JSON to the widget,
+exactly as in the [ALTCHA widget documentation](https://altcha.org/docs/integration/widget/); the
+browser therefore needs no route to the external server and the server does not have to allow the
+origin of the login page. Only when the fetch fails does the widget receive the URL and fetch the
+challenge itself (Keycloak logs a warning in that case) — then the server has to send
+`access-control-allow-origin` for the origin of the login page.
 
 | Server | Challenge URL | API key | Secret |
 |---|---|---|---|
@@ -124,18 +129,45 @@ exactly as in the [ALTCHA widget documentation](https://altcha.org/docs/integrat
 | Custom ALTCHA server | your `/challenge` endpoint | optional, if your server expects one | the `hmacSignatureSecret` your server signs challenges with |
 
 `altchaSecret` is required for verification and stays inside Keycloak: it is never rendered into a
-page. Payloads are checked locally, so Keycloak makes no outbound request when a form is submitted.
-Two signed payload formats are accepted:
+page. Payloads are checked locally, so Keycloak makes no outbound request when a form is submitted
+(unless `altchaVerifyUrl` is set, see below). Three signed payload formats are accepted:
 
 - **Sentinel / Cloud**: `verificationData` + `signature`. The HMAC and expiry checks match
   `verifyServerSignature` from `altcha-lib`.
 - **Custom server**: a challenge signed with `hmacSignatureSecret` (SHA-256 challenges). The
   signature over the challenge parameters is checked, then the proof of work is re-derived.
+- **Older server**: the flat payload of the first ALTCHA format
+  (`algorithm`, `challenge`, `number`, `salt`, `signature`). The proof of work is re-derived from
+  the salt and the number, and the signature over the challenge is checked with the secret.
 
 Unsigned payloads are rejected: without a signature anyone could submit a trivially easy challenge.
 If `altchaServerUrl` is set but `altchaSecret` is empty, Keycloak logs a warning and keeps issuing
 the built-in challenge instead of locking users out. In external mode `altchaDifficulty`,
 `altchaCost` and `altchaTtlSeconds` are ignored; the server decides them.
+
+### Reporting the verification to the external server
+
+Set `altchaVerifyUrl` to the verification endpoint of the external server and Keycloak reports every
+solved payload to it after the local check succeeded:
+
+```http
+POST /api/v1/verify?apiKey=key_...
+Content-Type: application/json
+
+{"payload":"<the base64 payload of the form field altcha>"}
+```
+
+The server answers `{"ok":true}` when it accepts the payload. The API key is appended the same way
+as for the challenge URL.
+
+The payload was checked cryptographically already, so the server cannot weaken the check — but it
+can keep its own statistics and refuse payloads it does not like (a replay, a bot score above its
+threshold):
+
+- the server accepts the payload → the step passes,
+- the server refuses it → the step fails,
+- the server cannot be reached → the step passes and a warning is logged, so an outage of the
+  external server does not lock anybody out.
 
 ### Admin REST API
 

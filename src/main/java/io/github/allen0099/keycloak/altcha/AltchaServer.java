@@ -3,11 +3,16 @@ package io.github.allen0099.keycloak.altcha;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -42,21 +47,109 @@ final class AltchaServer {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HexFormat HEX = HexFormat.of();
     private static final Pattern API_KEY_PARAMETER = Pattern.compile("[?&]apiKey=", Pattern.CASE_INSENSITIVE);
+    private static final Pattern EXPIRES_PARAMETER = Pattern.compile("[?&]expires=(\\d+)", Pattern.CASE_INSENSITIVE);
     private static final long MAX_COUNTER = 0xFFFFFFFFL;
+    private static final Duration FETCH_TIMEOUT = Duration.ofSeconds(10);
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     private AltchaServer() {}
+
+    /**
+     * Fetches the challenge of the external server, so that the browser does not have to.
+     *
+     * <p>The widget can fetch the challenge itself (it is given the URL), but then the browser
+     * needs a working route to the server and the server has to allow the origin of the login
+     * page.  Fetching the challenge here keeps that out of the browser: the challenge JSON goes
+     * into the page, the widget only solves it.
+     *
+     * @return the body of the answer (the challenge as JSON), or null when the server cannot be
+     *     reached or does not answer with a JSON object
+     */
+    static String fetchChallenge(String url) {
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(FETCH_TIMEOUT)
+                    .header("Accept", "application/json")
+                    .GET()
+                    .build();
+            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                return null;
+            }
+            String body = response.body();
+            if (body == null || body.isBlank()) {
+                return null;
+            }
+            JsonNode root = JSON.readTree(body);
+            return root != null && root.isObject() ? body : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /**
      * Returns the challenge URL the widget should fetch. When {@code apiKey} is set and the URL
      * does not carry one already, it is appended as the {@code apiKey} query parameter.
      */
     static String challengeUrl(String serverUrl, String apiKey) {
-        String url = serverUrl.trim();
+        return withApiKey(serverUrl, apiKey);
+    }
+
+    /**
+     * Returns the URL the verification is reported to. The API key is appended like in the
+     * challenge URL.
+     */
+    static String verifyUrl(String serverUrl, String apiKey) {
+        return withApiKey(serverUrl, apiKey);
+    }
+
+    private static String withApiKey(String serverUrl, String apiKey) {
+        String url = serverUrl == null ? "" : serverUrl.trim();
         if (apiKey == null || apiKey.isBlank() || API_KEY_PARAMETER.matcher(url).find()) {
             return url;
         }
         String separator = !url.contains("?") ? "?" : url.endsWith("?") || url.endsWith("&") ? "" : "&";
         return url + separator + "apiKey=" + URLEncoder.encode(apiKey.trim(), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Reports a solved payload to the verification endpoint of the external server, so that the
+     * server knows about the verification: it keeps its own statistics, and it can refuse
+     * payloads it does not like (a replay, a bot score above its threshold).
+     *
+     * <p>The payload is sent as it was submitted, base64 encoded, in the field {@code payload} --
+     * the shape the endpoints of the ALTCHA servers expect.
+     *
+     * @return {@code TRUE} when the server accepted the payload, {@code FALSE} when it refused it,
+     *     {@code null} when it could not be reached at all
+     */
+    static Boolean forwardVerification(String url, String payload) {
+        if (url == null || url.isBlank() || payload == null || payload.isBlank()) {
+            return null;
+        }
+        try {
+            String body = JSON.writeValueAsString(Map.of("payload", payload));
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(FETCH_TIMEOUT)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                return null;
+            }
+            JsonNode root = JSON.readTree(response.body());
+            return root != null && root.path("ok").asBoolean(false);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** True only for a correctly signed, unexpired payload from the external server. */
@@ -74,6 +167,12 @@ final class AltchaServer {
             }
             if (root.path("challenge").hasNonNull("signature")) {
                 return verifySignedChallenge(root, secret, nowSeconds);
+            }
+            if (root.path("challenge").isTextual()
+                    && root.hasNonNull("number")
+                    && root.hasNonNull("salt")
+                    && root.hasNonNull("signature")) {
+                return verifyLegacy(root, secret, nowSeconds);
             }
             return false;
         } catch (Exception e) {
@@ -99,6 +198,10 @@ final class AltchaServer {
         try {
             JsonNode root = JSON.readTree(Base64.getDecoder().decode(payload));
             String signature = root.path("signature").asText("");
+            if (root.path("challenge").isTextual() && root.hasNonNull("number") && root.hasNonNull("salt")) {
+                // The older format: the signature belongs to the challenge, so it identifies it.
+                return "legacy:" + signature;
+            }
             if (!signature.isEmpty()) {
                 return "sentinel:" + signature;
             }
@@ -177,6 +280,58 @@ final class AltchaServer {
                 parameters.path("keyLength").asInt(32)));
         return key.startsWith(parameters.path("keyPrefix").asText(""))
                 && constantTimeEquals(key, solution.path("derivedKey").asText(""));
+    }
+
+    /**
+     * A payload of the older ALTCHA format, as the widget builds it for a challenge of the older
+     * format: a flat object with the challenge, the number that solves it and the signature of
+     * the challenge.
+     *
+     * <p>The proof of work is re-derived here: the challenge is the SHA-256 digest of the salt
+     * and the number, and the signature is the HMAC of the challenge with the secret. The expiry
+     * travels in the salt ({@code ?expires=...}) and is checked as well.
+     */
+    private static boolean verifyLegacy(JsonNode root, String secret, long nowSeconds)
+            throws GeneralSecurityException {
+        String algorithm = root.path("algorithm").asText("");
+        if (!"SHA-256".equals(algorithm)) {
+            return false;
+        }
+        String salt = root.path("salt").asText("");
+        String challenge = root.path("challenge").asText("");
+        String signature = root.path("signature").asText("");
+        JsonNode number = root.path("number");
+        if (salt.isEmpty() || challenge.isEmpty() || signature.isEmpty()
+                || !(number.isNumber() || number.isTextual())) {
+            return false;
+        }
+        Long expiresAt = expiresAt(salt);
+        if (expiresAt != null && nowSeconds > expiresAt) {
+            return false;
+        }
+        if (!constantTimeEquals(hmacHex(algorithm, challenge.getBytes(StandardCharsets.UTF_8), secret),
+                signature)) {
+            return false;
+        }
+        String key = sha256Hex((salt + number.asText()).getBytes(StandardCharsets.UTF_8));
+        return constantTimeEquals(key, challenge);
+    }
+
+    /** The expiry of a challenge of the older format, if its salt carries one. */
+    private static Long expiresAt(String salt) {
+        var matcher = EXPIRES_PARAMETER.matcher(salt);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(matcher.group(1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static String sha256Hex(byte[] data) throws GeneralSecurityException {
+        return HEX.formatHex(MessageDigest.getInstance("SHA-256").digest(data));
     }
 
     private static boolean isServerAlgorithm(String algorithm) {
