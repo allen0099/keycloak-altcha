@@ -123,6 +123,10 @@ origin of the login page. Only when the fetch fails does the widget receive the 
 challenge itself (Keycloak logs a warning in that case) — then the server has to send
 `access-control-allow-origin` for the origin of the login page.
 
+The fetch is repeated up to three times (with a short pause in between) before that fallback is
+used: a hiccup of the external server should not push the burden of the challenge onto the
+browser.
+
 | Server | Challenge URL | API key | Secret |
 |---|---|---|---|
 | ALTCHA Sentinel / Cloud | `https://sentinel.example.com/v1/challenge` | public `key_...` | API key secret `sec_...` |

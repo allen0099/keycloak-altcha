@@ -50,6 +50,8 @@ final class AltchaServer {
     private static final Pattern EXPIRES_PARAMETER = Pattern.compile("[?&]expires=(\\d+)", Pattern.CASE_INSENSITIVE);
     private static final long MAX_COUNTER = 0xFFFFFFFFL;
     private static final Duration FETCH_TIMEOUT = Duration.ofSeconds(10);
+    private static final int FETCH_ATTEMPTS = 3;
+    private static final long FETCH_RETRY_DELAY_MS = 400L;
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .followRedirects(HttpClient.Redirect.NORMAL)
@@ -65,6 +67,11 @@ final class AltchaServer {
      * page.  Fetching the challenge here keeps that out of the browser: the challenge JSON goes
      * into the page, the widget only solves it.
      *
+     * <p>The server can hiccup (a timeout, a connection that is refused, an answer that is not
+     * JSON).  A single failed attempt would push the browser into the fallback -- the widget
+     * fetching the challenge itself -- and that route does not work for every network, so the
+     * request is repeated a few times before the fallback is used.
+     *
      * @return the body of the answer (the challenge as JSON), or null when the server cannot be
      *     reached or does not answer with a JSON object
      */
@@ -72,6 +79,24 @@ final class AltchaServer {
         if (url == null || url.isBlank()) {
             return null;
         }
+        for (int attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+            String challenge = fetchChallengeOnce(url);
+            if (challenge != null) {
+                return challenge;
+            }
+            if (attempt < FETCH_ATTEMPTS) {
+                try {
+                    Thread.sleep(FETCH_RETRY_DELAY_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String fetchChallengeOnce(String url) {
         try {
             HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                     .timeout(FETCH_TIMEOUT)
