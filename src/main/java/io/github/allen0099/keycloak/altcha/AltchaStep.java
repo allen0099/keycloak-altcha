@@ -2,6 +2,8 @@ package io.github.allen0099.keycloak.altcha;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.models.AuthenticatorConfigModel;
 import org.keycloak.provider.ProviderConfigProperty;
@@ -34,9 +36,15 @@ final class AltchaStep {
     static final String DIFFICULTY = "altchaDifficulty";
     static final String COST = "altchaCost";
     static final String TTL = "altchaTtlSeconds";
+    static final String SERVER_URL = "altchaServerUrl";
+    static final String API_KEY = "altchaApiKey";
+    static final String SECRET = "altchaSecret";
+    static final String VERIFY_URL = "altchaVerifyUrl";
 
     private static final String NOTE = "altcha.challenge";
     private static final long MAX_TTL = 3600;
+    private static final Logger LOG = Logger.getLogger(AltchaStep.class.getName());
+    private static final AtomicBoolean INCOMPLETE_SERVER_WARNED = new AtomicBoolean();
 
     // Labels and help texts are message keys: the admin console looks them up in the "messages"
     // bundle, which includes this jar's theme-resources/messages. (Factory display type and help
@@ -55,6 +63,18 @@ final class AltchaStep {
             .property().name(TTL).type(ProviderConfigProperty.INTEGER_TYPE)
             .label("altchaTtlLabel").helpText("altchaTtlHelp")
             .defaultValue(Altcha.Settings.DEFAULT.ttlSeconds()).add()
+            .property().name(SERVER_URL).type(ProviderConfigProperty.STRING_TYPE)
+            .label("altchaServerUrlLabel").helpText("altchaServerUrlHelp")
+            .defaultValue("").add()
+            .property().name(API_KEY).type(ProviderConfigProperty.STRING_TYPE)
+            .label("altchaApiKeyLabel").helpText("altchaApiKeyHelp")
+            .defaultValue("").add()
+            .property().name(SECRET).type(ProviderConfigProperty.PASSWORD)
+            .label("altchaSecretLabel").helpText("altchaSecretHelp").secret(true)
+            .defaultValue("").add()
+            .property().name(VERIFY_URL).type(ProviderConfigProperty.STRING_TYPE)
+            .label("altchaVerifyUrlLabel").helpText("altchaVerifyUrlHelp")
+            .defaultValue("").add()
             .build();
 
     private AltchaStep() {}
@@ -76,33 +96,129 @@ final class AltchaStep {
 
     /** Issue a fresh challenge for the page about to be rendered (no-op when disabled). */
     static void prepare(AuthenticationFlowContext context) {
-        if (!enabled(context.getAuthenticatorConfig())) {
+        AuthenticatorConfigModel config = context.getAuthenticatorConfig();
+        if (!enabled(config)) {
             context.getAuthenticationSession().removeAuthNote(NOTE);
             return;
         }
-        Altcha.Issued issued = Altcha.issue(settings(context.getAuthenticatorConfig()), now());
+        if (external(config)) {
+            // The challenge is fetched here, so the browser does not need a route to the external
+            // server and the server does not have to allow the origin of the login page.  Only
+            // when the fetch fails the widget gets the URL and has to fetch it itself.
+            context.getAuthenticationSession().removeAuthNote(NOTE);
+            String url = AltchaServer.challengeUrl(serverUrl(config), apiKey(config));
+            String challenge = AltchaServer.fetchChallenge(url);
+            if (challenge != null) {
+                context.form().setAttribute(ATTRIBUTE, challenge);
+            } else {
+                LOG.warning("could not fetch the challenge from the external server; the widget "
+                        + "has to fetch it itself");
+                context.form().setAttribute(ATTRIBUTE, url);
+            }
+            return;
+        }
+        warnIfServerUrlIsUnusable(config);
+        Altcha.Issued issued = Altcha.issue(settings(config), now());
         context.getAuthenticationSession().setAuthNote(NOTE, issued.record());
         context.form().setAttribute(ATTRIBUTE, issued.challengeJson());
     }
 
     /** Check the submitted payload. Consumes the challenge either way, so an answer works once. */
     static boolean passes(AuthenticationFlowContext context, String payload) {
-        if (!enabled(context.getAuthenticatorConfig())) {
+        AuthenticatorConfigModel config = context.getAuthenticatorConfig();
+        if (!enabled(config)) {
             return true;
         }
-        String record = context.getAuthenticationSession().getAuthNote(NOTE);
-        context.getAuthenticationSession().removeAuthNote(NOTE);
-        // Removing the note only stops sequential reuse: parallel requests in one auth session all
-        // read it before the removal is committed. The single-use store's putIfAbsent is atomic,
-        // cluster-wide too, so only one of them gets through. The entry outlives any challenge.
-        boolean passed = Altcha.verify(record, payload, now())
-                && context.getSession().singleUseObjects().putIfAbsent(NOTE + ":" + record, MAX_TTL);
+        boolean passed;
+        if (external(config)) {
+            // The server signature proves the payload came from the configured server; the
+            // single-use store, not an auth note, stops a valid payload from being replayed.
+            boolean verified = AltchaServer.verify(payload, secret(config), now());
+            passed = verified
+                    && report(config, payload)
+                    && context.getSession()
+                            .singleUseObjects()
+                            .putIfAbsent(NOTE + ":server:" + AltchaServer.replayKey(payload), MAX_TTL);
+        } else {
+            warnIfServerUrlIsUnusable(config);
+            String record = context.getAuthenticationSession().getAuthNote(NOTE);
+            context.getAuthenticationSession().removeAuthNote(NOTE);
+            // Removing the note only stops sequential reuse: parallel requests in one auth session
+            // all read it before the removal is committed. The single-use store's putIfAbsent is
+            // atomic, cluster-wide too, so only one of them gets through. The entry outlives any
+            // challenge.
+            passed = Altcha.verify(record, payload, now())
+                    && context.getSession().singleUseObjects().putIfAbsent(NOTE + ":" + record, MAX_TTL);
+        }
         if (passed) {
             // Only reaches events logged in this request; a login finished later (OTP,
             // required actions) carries no detail. Persist it as an auth note if those must count.
             context.getEvent().detail(EVENT_DETAIL, EVENT_DETAIL_PASSED);
         }
         return passed;
+    }
+
+    /**
+     * Reports a solved payload to the external server, so that the server knows about the
+     * verification: it keeps its own statistics, and it can refuse payloads it does not like (a
+     * replay, a bot score above its threshold).
+     *
+     * <p>The payload was checked cryptographically already, so a server that cannot be reached
+     * must not lock anybody out: the step passes and the problem is logged. A server that refuses
+     * the payload is believed, and the step fails.
+     */
+    private static boolean report(AuthenticatorConfigModel config, String payload) {
+        String url = verifyUrl(config);
+        if (url.isEmpty()) {
+            return true;
+        }
+        Boolean accepted =
+                AltchaServer.forwardVerification(AltchaServer.verifyUrl(url, apiKey(config)), payload);
+        if (accepted == null) {
+            LOG.warning("could not report the ALTCHA verification to the external server " + url);
+            return true;
+        }
+        if (!accepted) {
+            LOG.warning("the external server refused the ALTCHA verification of the payload");
+        } else {
+            LOG.info("reported the ALTCHA verification to the external server " + url);
+        }
+        return accepted;
+    }
+
+    /** With a server URL but no secret the payload cannot be checked, so the built-in mode is used. */
+    static boolean external(AuthenticatorConfigModel config) {
+        return !serverUrl(config).isEmpty() && !secret(config).isEmpty();
+    }
+
+    private static void warnIfServerUrlIsUnusable(AuthenticatorConfigModel config) {
+        if (!serverUrl(config).isEmpty()
+                && secret(config).isEmpty()
+                && INCOMPLETE_SERVER_WARNED.compareAndSet(false, true)) {
+            LOG.warning("altchaServerUrl is set without altchaSecret; cannot verify external "
+                    + "challenges, using the built-in challenge instead");
+        }
+    }
+
+    private static String serverUrl(AuthenticatorConfigModel config) {
+        return text(config, SERVER_URL);
+    }
+
+    private static String apiKey(AuthenticatorConfigModel config) {
+        return text(config, API_KEY);
+    }
+
+    private static String secret(AuthenticatorConfigModel config) {
+        return text(config, SECRET);
+    }
+
+    private static String verifyUrl(AuthenticatorConfigModel config) {
+        return text(config, VERIFY_URL);
+    }
+
+    private static String text(AuthenticatorConfigModel config, String key) {
+        String value = values(config).get(key);
+        return value == null ? "" : value.trim();
     }
 
     private static Map<String, String> values(AuthenticatorConfigModel config) {

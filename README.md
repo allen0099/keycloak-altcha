@@ -3,11 +3,15 @@
 Keycloak authenticators that require an [ALTCHA](https://altcha.org/) proof-of-work challenge to be
 solved on the login page and the forgot-password page.
 
-- **No secret key, no outbound calls.** Keycloak issues the challenge and keeps it in the current
-  authentication session. Each challenge is single use: it is removed on every check, whether the
-  check passes or not.
-- **No third-party service.** Only the ALTCHA browser widget (npm `altcha` 3.x) is used. The
-  server-side check is implemented in this repository and has no ALTCHA server-library dependency.
+- **No secret key, no outbound calls by default.** Keycloak issues the challenge and keeps it in
+  the current authentication session. Each challenge is single use: it is removed on every check,
+  whether the check passes or not.
+- **No third-party service by default.** Only the ALTCHA browser widget (npm `altcha` 3.x) is used.
+  The server-side check is implemented in this repository and has no ALTCHA server-library
+  dependency.
+- **Optional external ALTCHA server.** Point the widget at your own ALTCHA server (for example
+  ALTCHA Sentinel or Cloud) and give Keycloak the matching secret. Payloads are verified
+  locally against that secret; Keycloak does not call the server.
 - **Configurable in the admin console** (or through the Admin REST API), separately for login and
   password reset.
 
@@ -98,12 +102,76 @@ step. Labels and help texts are translated (English and Traditional Chinese bund
 | `altchaDifficulty` | Leading zero hex digits the solution needs; each step multiplies the work by 16 | `4` | `3`, `4` |
 | `altchaCost` | SHA-256 iterations per attempt; work grows linearly, for fine tuning | `1` | 1–1000 |
 | `altchaTtlSeconds` | How long an issued challenge stays valid | `600` | 60–3600 |
+| `altchaServerUrl` | Challenge endpoint of an external ALTCHA server; Keycloak fetches the challenges from it | empty (built-in) | any HTTP(S) URL |
+| `altchaApiKey` | Public API key (`key_...`) added to the server URL as `apiKey=...` when the URL has none | empty | any string |
+| `altchaSecret` | API key secret (`sec_...`) or the HMAC key of the external server, used to verify payloads | empty | any string |
+| `altchaVerifyUrl` | Verification endpoint of the external server; a solved payload is reported to it | empty (no reporting) | any HTTP(S) URL |
 
 - With no config saved, the defaults apply and ALTCHA is **on**.
 - Missing, unparsable or out-of-range values fall back to the default; they never break logins.
 - Login and password reset have **separate** configs (each is attached to its own step).
 - Settings are captured when a challenge is issued, so changing them does not break pages that are
   already open.
+
+### External ALTCHA server
+
+Set `altchaServerUrl` (and normally `altchaApiKey`) to delegate challenge generation to your own
+ALTCHA server. Keycloak fetches the challenge from that server and hands the JSON to the widget,
+exactly as in the [ALTCHA widget documentation](https://altcha.org/docs/integration/widget/); the
+browser therefore needs no route to the external server and the server does not have to allow the
+origin of the login page. Only when the fetch fails does the widget receive the URL and fetch the
+challenge itself (Keycloak logs a warning in that case) — then the server has to send
+`access-control-allow-origin` for the origin of the login page.
+
+The fetch is repeated up to three times (with a short pause in between) before that fallback is
+used: a hiccup of the external server should not push the burden of the challenge onto the
+browser.
+
+| Server | Challenge URL | API key | Secret |
+|---|---|---|---|
+| ALTCHA Sentinel / Cloud | `https://sentinel.example.com/v1/challenge` | public `key_...` | API key secret `sec_...` |
+| Custom ALTCHA server | your `/challenge` endpoint | optional, if your server expects one | the `hmacSignatureSecret` your server signs challenges with |
+
+`altchaSecret` is required for verification and stays inside Keycloak: it is never rendered into a
+page. Payloads are checked locally, so Keycloak makes no outbound request when a form is submitted
+(unless `altchaVerifyUrl` is set, see below). Three signed payload formats are accepted:
+
+- **Sentinel / Cloud**: `verificationData` + `signature`. The HMAC and expiry checks match
+  `verifyServerSignature` from `altcha-lib`.
+- **Custom server**: a challenge signed with `hmacSignatureSecret` (SHA-256 challenges). The
+  signature over the challenge parameters is checked, then the proof of work is re-derived.
+- **Older server**: the flat payload of the first ALTCHA format
+  (`algorithm`, `challenge`, `number`, `salt`, `signature`). The proof of work is re-derived from
+  the salt and the number, and the signature over the challenge is checked with the secret.
+
+Unsigned payloads are rejected: without a signature anyone could submit a trivially easy challenge.
+If `altchaServerUrl` is set but `altchaSecret` is empty, Keycloak logs a warning and keeps issuing
+the built-in challenge instead of locking users out. In external mode `altchaDifficulty`,
+`altchaCost` and `altchaTtlSeconds` are ignored; the server decides them.
+
+### Reporting the verification to the external server
+
+Set `altchaVerifyUrl` to the verification endpoint of the external server and Keycloak reports every
+solved payload to it after the local check succeeded:
+
+```http
+POST /api/v1/verify?apiKey=key_...
+Content-Type: application/json
+
+{"payload":"<the base64 payload of the form field altcha>"}
+```
+
+The server answers `{"ok":true}` when it accepts the payload. The API key is appended the same way
+as for the challenge URL.
+
+The payload was checked cryptographically already, so the server cannot weaken the check — but it
+can keep its own statistics and refuse payloads it does not like (a replay, a bot score above its
+threshold):
+
+- the server accepts the payload → the step passes,
+- the server refuses it → the step fails,
+- the server cannot be reached → the step passes and a warning is logged, so an outage of the
+  external server does not lock anybody out.
 
 ### Admin REST API
 
@@ -121,6 +189,10 @@ kcadm.sh create "authentication/executions/$EXECUTION_ID/config" -r "$REALM" \
 # Change it. PUT replaces the whole config: keys you leave out go back to their defaults.
 kcadm.sh update "authentication/config/$CONFIG_ID" -r "$REALM" -b \
   '{"id":"'"$CONFIG_ID"'","alias":"altcha-login","config":{"altchaEnabled":"true","altchaDifficulty":"4","altchaCost":"2","altchaTtlSeconds":"600"}}'
+
+# Or delegate challenges to your own ALTCHA server:
+kcadm.sh update "authentication/config/$CONFIG_ID" -r "$REALM" -b \
+  '{"id":"'"$CONFIG_ID"'","alias":"altcha-login","config":{"altchaEnabled":"true","altchaServerUrl":"https://sentinel.example.com/v1/challenge","altchaApiKey":"key_...","altchaSecret":"sec_..."}}'
 ```
 
 `kcadm.sh get ... --fields config` does not expand map values and shows the config as empty; use a
@@ -139,9 +211,11 @@ Administrators tune these settings in the console, so automation must not reset 
 
 The jar issues and checks challenges; the login theme renders the widget.
 
-- The challenge JSON is the template attribute **`altchaChallenge`**, set on `login.ftl` and
-  `login-reset-password.ftl` only. It is **absent** when ALTCHA is disabled or the flow does not use
-  these steps; render no widget then. With Keycloakify it appears in `kcContext.altchaChallenge`.
+- The challenge JSON — or, with an external server, the challenge URL — is the template attribute
+  **`altchaChallenge`**, set on `login.ftl` and `login-reset-password.ftl` only. It is **absent**
+  when ALTCHA is disabled or the flow does not use these steps; render no widget then. With
+  Keycloakify it appears in `kcContext.altchaChallenge`. The widget's `challenge` attribute accepts
+  either form, so the markup below works in both modes.
 - The widget must sit inside the form and submit its payload in the field **`altcha`**:
 
   ```html
@@ -171,6 +245,9 @@ The jar issues and checks challenges; the login theme renders the widget.
   payload, or solving a challenge from an older page, fails. Parallel submissions of one solution
   are caught too: an accepted solution is also recorded in Keycloak's single-use object store,
   which is atomic across a cluster.
+- When an external server is configured, the secret is stored in the authenticator config (masked
+  in the admin console). Keep the realm's database and backups as safe as the secret. The public
+  API key is the only part sent to the browser.
 
 ## Upgrading
 
